@@ -1,10 +1,10 @@
 use core::mem::ManuallyDrop;
-use core::mem::MaybeUninit;
 use core::pin::Pin;
 use core::sync::atomic::AtomicPtr;
 use core::sync::atomic::Ordering;
 use std::marker::PhantomPinned;
 
+#[repr(C)]
 pub struct QueueNode<T> {
     next: AtomicPtr<QueueNode<T>>,
     data: T,
@@ -21,7 +21,7 @@ pub struct Queue<T> {
     // INVARIANT: tail_ptr is always a valid pointer
     tail_ptr: AtomicPtr<QueueNode<T>>,
     // dummy node, only for initialization purposes
-    dummy: QueueNode<T>,
+    dummy: AtomicPtr<QueueNode<T>>,
     _marker: PhantomPinned,
 }
 
@@ -42,8 +42,7 @@ impl<T> Queue<T> {
         Self {
             head_ptr: Default::default(),
             tail_ptr: Default::default(),
-            // SAFETY: dummy.data is never read
-            dummy: QueueNode::new(MaybeUninit::uninit().assume_init()),
+            dummy: Default::default(),
             _marker: PhantomPinned,
         }
     }
@@ -53,8 +52,9 @@ impl<T> Queue<T> {
     // .pop
     pub unsafe fn init(self: Pin<&mut Self>) {
         let pself = self.get_unchecked_mut();
-        // SAFETY: only value of the pointer is used, not dereferenced
-        let ptr = &mut pself.dummy as *mut _;
+        // SAFETY: only the first argument of QueueNode<T> is used for the dummy node, which is
+        // exactly AtomicPtr<QueueNode<T>
+        let ptr = &mut pself.dummy as *mut AtomicPtr<QueueNode<T>> as *mut QueueNode<T>;
         // SAFETY: these writes don't move any data
         pself.head_ptr.store(ptr, Ordering::Release);
         pself.tail_ptr.store(ptr, Ordering::Release);
@@ -68,12 +68,14 @@ impl<T> Queue<T> {
         // Attempt to place new_node as the tail.next, returning the pointer to the old tail when we do
         let raw_tail_ptr = loop {
             let raw_tail_ptr = self.tail_ptr.load(Ordering::Acquire);
-            // SAFETY: self.tail_ptr is always valid
-            let tail_ptr = unsafe { &*raw_tail_ptr };
-            let tail_next_ptr = tail_ptr.next.load(Ordering::Acquire);
-            if tail_next_ptr == core::ptr::null_mut() {
+            // SAFETY: tail_ptr always valid, and first field of the struct is the next pointer
+            let tail_next_ptr = raw_tail_ptr.cast::<AtomicPtr<QueueNode<T>>>();
+            // SAFETY: self.tail_ptr always valid
+            let tail_next = unsafe { &*tail_next_ptr };
+            let raw_tail_next_ptr = tail_next.load(Ordering::Acquire);
+            if raw_tail_next_ptr == core::ptr::null_mut() {
                 // We are at the true end, attempt to swap ourselves in
-                if let Ok(_) = tail_ptr.next.compare_exchange(
+                if let Ok(_) = tail_next.compare_exchange(
                     core::ptr::null_mut(),
                     new_ptr,
                     Ordering::AcqRel,
@@ -85,7 +87,7 @@ impl<T> Queue<T> {
                 // We are not at the end, "help" the tail along
                 let _ = self.tail_ptr.compare_exchange(
                     raw_tail_ptr,
-                    tail_next_ptr,
+                    raw_tail_next_ptr,
                     Ordering::AcqRel,
                     Ordering::Relaxed,
                 );
@@ -109,9 +111,12 @@ impl<T> Queue<T> {
         loop {
             let raw_head_ptr = self.head_ptr.load(Ordering::Acquire);
             let raw_tail_ptr = self.tail_ptr.load(Ordering::Acquire);
+            // SAFETY: self.head_ptr is valid, and the layout of the struct guarantees that the
+            // first field is the next_ptr
+            let head_next_ptr = raw_head_ptr.cast::<AtomicPtr<QueueNode<T>>>();
             // SAFETY: self.head_ptr is always valid
-            let head_ptr = unsafe { &*raw_head_ptr };
-            let raw_head_next_ptr = head_ptr.next.load(Ordering::Acquire);
+            let head_next = unsafe { &*head_next_ptr };
+            let raw_head_next_ptr = head_next.load(Ordering::Acquire);
 
             if raw_head_ptr as usize == raw_tail_ptr as usize {
                 // If we've reached the end of the queue, we are empty
@@ -160,8 +165,7 @@ mod with_std {
             }
         }
 
-        pub fn push(self: Pin<&Self>, data: T) {
-            let mut node = Box::pin(QueueNode::new(data));
+        pub fn push(self: Pin<&Self>, node: &mut Pin<Box<QueueNode<T>>>) {
             self.push_node(node.as_mut());
         }
     }
@@ -176,13 +180,20 @@ mod tests {
         let q = Queue::<i32>::new_pinned();
         let q = q.as_ref();
 
+        macro_rules! push {
+            ($i:expr) => {
+                let mut node = Box::pin(QueueNode::new($i));
+                q.push(&mut node);
+            };
+        }
+
         assert_eq!(q.pop(), None, "initial queue should return None");
-        q.push(1);
-        q.push(2);
-        q.push(3);
+        push!(1);
+        push!(2);
+        push!(3);
         assert_eq!(q.pop(), Some(1));
         assert_eq!(q.pop(), Some(2));
-        q.push(4);
+        push!(4);
         assert_eq!(q.pop(), Some(3));
         assert_eq!(q.pop(), Some(4));
         assert_eq!(q.pop(), None, "final drained queue should return None");
